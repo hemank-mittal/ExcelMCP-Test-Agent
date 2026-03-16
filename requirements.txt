@@ -1,0 +1,13 @@
+# ExcelMCP Agent — Dependencies
+# Python 3.10–3.13 required  (crewai requires <3.14)
+# This project uses Python 3.12, installed via: winget install Python.Python.3.12
+
+# CrewAI multi-agent framework + Anthropic native provider
+crewai[anthropic]>=1.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Terminal UI
+rich>=13.0.0
