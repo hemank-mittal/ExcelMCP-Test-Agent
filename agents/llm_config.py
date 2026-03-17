@@ -75,3 +75,45 @@ def get_llm() -> LLM:
         api_key=anthropic_key,
         max_tokens=4096,
     )
+
+
+def get_litellm_config() -> dict:
+    """
+    Return raw litellm call parameters for direct (non-CrewAI) LLM calls.
+    Used by the chat mode conversation loop.
+
+    Returns dict with keys: model, api_key, and optionally base_url.
+    Pass as **get_litellm_config() to litellm.completion().
+    """
+    provider  = os.getenv("AGENT_PROVIDER", "").lower().strip()
+    xai_key   = os.getenv("XAI_API_KEY")   or os.getenv("GROK_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+
+    if not provider:
+        if xai_key:
+            provider = "grok"
+        elif openai_key:
+            provider = "openai"
+        else:
+            provider = "anthropic"
+
+    model = os.getenv("AGENT_MODEL", _DEFAULTS.get(provider, "gpt-4o-mini"))
+
+    if provider == "grok":
+        return {
+            "model": f"openai/{model}",
+            "api_key": xai_key,
+            "base_url": "https://api.x.ai/v1",
+        }
+    if provider == "openai":
+        return {
+            "model": f"openai/{model}",
+            "api_key": openai_key,
+        }
+    # Anthropic
+    return {
+        "model": f"anthropic/{model}",
+        "api_key": anthropic_key,
+        "max_tokens": 4096,
+    }

@@ -66,6 +66,290 @@ EXCEL_MCP_INPUT_DIR = os.getenv(
     "EXCEL_MCP_INPUT_DIR",
     r"c:\_Internal_ViewPoint_Projects\Jon-ExcelMCP3\inputs",
 )
+EXCEL_MCP_CWD = os.getenv(
+    "EXCEL_MCP_CWD",
+    r"c:\_Internal_ViewPoint_Projects\Jon-ExcelMCP3",
+)
+
+
+# ---------------------------------------------------------------------------
+# Mode selection
+# ---------------------------------------------------------------------------
+
+def ask_mode_interactive() -> str:
+    """
+    First prompt shown to the user — returns 'analyze' or 'create'.
+    'analyze' → normal flow (file select → WF1-5)
+    'create'  → chat mode (describe a workbook, generate YAML, run WF2)
+    """
+    table = Table(title="What would you like to do?", show_lines=True)
+    table.add_column("#", style="cyan bold", width=3)
+    table.add_column("Mode", style="white")
+    table.add_column("Description", style="dim")
+    table.add_row("1", "Analyze / Improve existing workbook",
+                  "Select an Excel file and run WF1–WF5 analysis or improvement workflows")
+    table.add_row("2", "Create new workbook from description",
+                  "Describe what you want — the agent generates a config and builds it with WF2")
+    console.print(table)
+
+    raw = Prompt.ask("\nSelect mode", choices=["1", "2"], default="1", console=console)
+    return "create" if raw.strip() == "2" else "analyze"
+
+
+# ---------------------------------------------------------------------------
+# Chat mode — conversational workbook creation
+# ---------------------------------------------------------------------------
+
+def run_chat_mode() -> None:
+    """
+    Conversational workbook creation:
+      1. Show available templates
+      2. Multi-turn LLM conversation to gather requirements
+      3. Generate WF2 YAML config
+      4. User confirms → run WF2
+      5. Final report
+    """
+    import re as _re
+    import litellm
+    from agents.llm_config import get_litellm_config
+    from tools.template_scanner import scan_templates_raw, format_templates_for_prompt
+    from tools.cli_runner import run_cli
+
+    try:
+        import yaml as _yaml
+    except ImportError:
+        console.print("[red]pyyaml not installed. Run: pip install pyyaml[/red]")
+        return
+
+    llm_cfg = get_litellm_config()
+
+    # ---- Scan templates ----
+    templates = scan_templates_raw()
+    templates_text = format_templates_for_prompt(templates)
+
+    console.rule("[bold cyan]Create Workbook — Chat Mode[/bold cyan]")
+    console.print(
+        "\n[bold]Available Templates[/bold] (as reference — agent can use or adapt them):"
+    )
+    if templates:
+        t_table = Table(show_header=True, box=None, padding=(0, 2))
+        t_table.add_column("Template", style="cyan")
+        t_table.add_column("Description", style="dim")
+        t_table.add_column("Sheets", style="dim")
+        for t in templates:
+            t_table.add_row(
+                t["name"],
+                t["description"] or "—",
+                ", ".join(t["sheet_names"]) or "—",
+            )
+        console.print(t_table)
+    else:
+        console.print("[dim]No templates found.[/dim]")
+
+    console.print(
+        "\n[dim]Describe the workbook you want. The agent will ask clarifying questions.\n"
+        "Commands: [cyan]/templates[/cyan] [cyan]/help[/cyan] [cyan]/clear[/cyan] "
+        "— type [cyan]done[/cyan] or [cyan]/done[/cyan] when ready to generate.[/dim]\n"
+    )
+
+    # ---- System prompt ----
+    system_prompt = (
+        "You are an ExcelMCP workbook configuration expert. "
+        "Your job is to understand the user's workbook requirements through conversation, "
+        "then generate a valid WF2 YAML configuration.\n\n"
+        "YAML SCHEMA (required):\n"
+        "  metadata:\n"
+        "    name: WorkbookName\n"
+        "    title: Full Title\n"
+        "    description: '...'\n"
+        "  output:\n"
+        "    path: 'generated_workbooks/<Name>/<Name>.xlsx'\n"
+        "    format: xlsx\n"
+        "    template_mode: true\n"
+        "    overwrite: true\n"
+        "  connection:\n"
+        "    server: 'placeholder'\n"
+        "    database: 'placeholder'\n"
+        "    auth_type: sql\n"
+        "    username: 'placeholder'\n"
+        "    password: 'placeholder'\n"
+        "  sheets:\n"
+        "    - name: SheetName\n"
+        "      type: data         # data | cover | summary | dashboard\n"
+        "      purpose: '...'\n"
+        "      sql: |\n"
+        "        SELECT ... FROM ...\n"
+        "  formatting:\n"
+        "    semantic_colors: true\n"
+        "    auto_filter: true\n"
+        "    freeze_panes: B2\n\n"
+        "RULES:\n"
+        "- Always set template_mode: true (offline mode, no live DB needed)\n"
+        "- connection.server/database/username/password must be the literal string 'placeholder' — "
+        "do NOT use ${VAR} syntax (env vars are not resolved in template mode)\n"
+        "- Each data sheet MUST have a sql field\n"
+        "- Sheet names MUST NOT contain special characters: no &, /, \\, ?, *, [, ]\n"
+        "  Use underscores or full words instead (e.g. 'Profit_Loss' not 'P&L', 'Cash_Flow' not 'C/F')\n"
+        "- Do NOT use ORDER BY at top level of SQL — use sort_by instead\n"
+        "- Viewpoint tables: JCJM (job cost), JCCD (cost details), GLBL (GL), APVM (vendors)\n\n"
+        f"AVAILABLE TEMPLATES (for reference):\n{templates_text}\n\n"
+        "BEHAVIOR:\n"
+        "- Ask clarifying questions: report name, sheets needed, data/filters, client\n"
+        "- Keep responses concise\n"
+        "- When the user says 'done' or 'generate', output ONLY the raw YAML — "
+        "no markdown fences, no explanation, just the YAML starting with 'metadata:' or 'output:'"
+    )
+
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    yaml_text: str = ""
+
+    # ---- Conversation loop ----
+    while True:
+        try:
+            user_input = Prompt.ask("[cyan]You[/cyan]", console=console).strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Chat cancelled.[/yellow]")
+            return
+
+        if not user_input:
+            continue
+
+        # Slash commands
+        lower = user_input.lower()
+        if lower in ("/done", "done", "/generate", "generate"):
+            # Trigger YAML generation
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Generate the final YAML configuration now. "
+                    "Output ONLY the raw YAML — no markdown fences, no explanation text."
+                )
+            })
+            break
+        if lower == "/templates":
+            console.print(templates_text)
+            continue
+        if lower == "/help":
+            console.print(
+                "[dim]/templates[/dim] — list templates\n"
+                "[dim]/clear[/dim]     — reset conversation\n"
+                "[dim]done[/dim]       — generate YAML and proceed"
+            )
+            continue
+        if lower == "/clear":
+            messages = [{"role": "system", "content": system_prompt}]
+            console.print("[dim]Conversation cleared.[/dim]")
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+
+        # Get LLM response
+        try:
+            resp = litellm.completion(messages=messages, **llm_cfg)
+            assistant_text = resp.choices[0].message.content or ""
+            messages.append({"role": "assistant", "content": assistant_text})
+            console.print(f"\n[magenta]Agent:[/magenta] {assistant_text}\n")
+        except Exception as exc:
+            console.print(f"[red]LLM error: {exc}[/red]")
+            return
+
+    # ---- Generate YAML ----
+    console.print("\n[dim]Generating YAML configuration...[/dim]")
+    try:
+        resp = litellm.completion(messages=messages, **llm_cfg)
+        raw_yaml = resp.choices[0].message.content or ""
+    except Exception as exc:
+        console.print(f"[red]YAML generation failed: {exc}[/red]")
+        return
+
+    # Strip markdown fences if LLM added them anyway
+    raw_yaml = _re.sub(r"^```[a-z]*\n?", "", raw_yaml, flags=_re.MULTILINE)
+    raw_yaml = _re.sub(r"\n?```$", "", raw_yaml, flags=_re.MULTILINE)
+    raw_yaml = raw_yaml.strip()
+
+    # Validate YAML is parseable
+    try:
+        config_dict = _yaml.safe_load(raw_yaml)
+        if not isinstance(config_dict, dict):
+            raise ValueError("Generated content is not a YAML mapping")
+    except Exception as exc:
+        console.print(f"[red]Generated YAML is invalid: {exc}[/red]")
+        console.print(Panel(raw_yaml, title="Raw Output", border_style="red"))
+        return
+
+    # ---- Show YAML for review ----
+    console.print()
+    console.print(Panel(
+        raw_yaml,
+        title="[bold cyan]Generated WF2 Config — Review Before Running[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    ))
+
+    if not Confirm.ask("\nRun WF2 (create) with this config?", default=True, console=console):
+        console.print("[yellow]Cancelled — config not saved.[/yellow]")
+        return
+
+    # ---- Save YAML ----
+    wb_name = (
+        config_dict.get("metadata", {}).get("name")
+        or config_dict.get("output", {}).get("filename", "").replace(".xlsx", "")
+        or "generated_workbook"
+    )
+    safe_name = _re.sub(r"[^\w\-]", "_", wb_name).strip("_") or "generated_workbook"
+    config_dir = Path(EXCEL_MCP_CWD) / "generated_workbooks" / safe_name / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    yaml_path = config_dir / f"{safe_name}.yaml"
+    yaml_path.write_text(raw_yaml, encoding="utf-8")
+    console.print(f"[dim]Config saved: {yaml_path}[/dim]\n")
+
+    # ---- Run WF2 ----
+    console.rule(f"[bold cyan]WF2 — Workbook Creation[/bold cyan]")
+    console.print(f"[dim]Command: python main.py create --config \"{yaml_path}\"[/dim]\n")
+
+    result = run_cli(["create", "--config", str(yaml_path)], timeout=900)
+
+    # Detect hidden failures: WF2 exits 0 but reports "Failed: N" in batch summary
+    import re as _re2
+    hidden_fail = False
+    if result.success and result.stdout:
+        m = _re2.search(r"Failed:\s*([1-9]\d*)", result.stdout)
+        if m:
+            hidden_fail = True
+
+    real_success = result.success and not hidden_fail
+    status_color = "green" if real_success else "red"
+    status_word = "COMPLETED" if real_success else "FAILED"
+    console.print(f"\n[{status_color}]WF2 {status_word} in {result.duration:.0f}s[/{status_color}]")
+
+    if not real_success:
+        # Show full stdout so user can see WF2's own error messages
+        console.print(f"\n[red]WF2 reported a failure. Full output:[/red]")
+        if result.stdout:
+            console.print(Panel(result.stdout[-1500:], title="stdout", border_style="red", expand=False))
+        if result.stderr:
+            console.print(Panel(result.stderr[-800:], title="stderr", border_style="red", expand=False))
+
+    # ---- Report ----
+    console.print()
+    console.print(Panel(
+        "\n".join([
+            "=" * 60,
+            "  ExcelMCP Agent — Workbook Creation Report",
+            "=" * 60,
+            f"  Workbook Name : {wb_name}",
+            f"  Config File   : {yaml_path}",
+            f"  Mode          : Chat → WF2 Create",
+            f"  Status        : {status_word}",
+            f"  Duration      : {result.duration:.0f}s",
+            "",
+            f"  Output        : {result.stdout[-500:] if result.stdout else 'none'}",
+            "=" * 60,
+        ]),
+        title=f"[bold {'green' if real_success else 'red'}]Creation Report[/bold {'green' if real_success else 'red'}]",
+        border_style=status_color,
+        expand=False,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +713,15 @@ def main() -> None:
                 "[yellow]Warning: No LLM API key found (ANTHROPIC_API_KEY / GROK_API_KEY / "
                 "OPENAI_API_KEY). AI crew mode will fail. Use --no-crew for CLI-only mode.[/yellow]"
             )
+
+    # ---------------------------------------------------------------------------
+    # Step 0: Mode selection (only in fully interactive, no pre-selected flags)
+    # ---------------------------------------------------------------------------
+    if not args.autonomous and not args.workbook and not args.workflow:
+        mode_choice = ask_mode_interactive()
+        if mode_choice == "create":
+            run_chat_mode()
+            return
 
     # ---------------------------------------------------------------------------
     # Step 1: File selection

@@ -164,9 +164,20 @@ def parse_wf3_outputs_internal(
     # Check if SQL was embedded in Power Query (from original doc JSON)
     doc_dir = root / "documentation"
     if doc_dir.exists():
-        json_files = list(doc_dir.glob("*.json"))
-        if json_files:
-            doc_json = _read_json_safe(json_files[0])
+        # Target *-Analysis.json (contains power_queries with M code)
+        analysis_files = list(doc_dir.glob("*-Analysis.json"))
+        if not analysis_files:
+            _skip = {"complexity_assessment.json"}
+            analysis_files = [
+                f for f in doc_dir.glob("*.json")
+                if f.name not in _skip
+                and "validation" not in f.name.lower()
+                and "assumptions" not in f.name.lower()
+                and "profile" not in f.name.lower()
+                and "summary" not in f.name.lower()
+            ]
+        if analysis_files:
+            doc_json = _read_json_safe(analysis_files[0])
             signals.sql_in_power_query = _detect_sql_in_power_query(doc_json)
 
     return signals
