@@ -97,6 +97,98 @@ def ask_mode_interactive() -> str:
 
 
 # ---------------------------------------------------------------------------
+# OOXML post-processor — injects xl/connections.xml so queries are visible
+# ---------------------------------------------------------------------------
+
+def _inject_query_connections(xlsx_path, config_dict: dict) -> None:
+    """
+    Post-process the XLSX ZIP to register Power Query connections in xl/connections.xml.
+    Without this, WF2 embeds M code in the DataMashup binary but Excel's Queries &
+    Connections panel shows "0 queries" because there is no XML registration.
+
+    Must be called after WF2 has successfully written the .xlsx file.
+    """
+    import zipfile as _zip
+    import tempfile as _tmp
+    from pathlib import Path as _Path
+
+    xlsx_path = _Path(xlsx_path)
+    if not xlsx_path.exists():
+        return
+
+    # All queries WF2 creates in template mode
+    standard = ["Server", "Database", "Connection"]
+    sheet_qs = [
+        s["name"] for s in config_dict.get("sheets", [])
+        if s.get("type", "data") not in ("cover", "summary", "dashboard", "summary_page")
+    ]
+    all_queries = standard + [q for q in sheet_qs if q not in standard]
+
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', f'<connections xmlns="{ns}">']
+    for i, qname in enumerate(all_queries, start=1):
+        provider = (
+            f"Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;"
+            f"Location={qname};Extended Properties=&quot;&quot;"
+        )
+        lines += [
+            f'  <connection id="{i}" name="{qname}" type="5" refreshedVersion="3"'
+            f' minRefreshableVersion="3" saveData="0" background="1"'
+            f' description="Mashup query - {qname}">',
+            f'    <dbPr connection="{provider}" commandType="6" command="SELECT * FROM [{qname}]"/>',
+            f'  </connection>',
+        ]
+    lines.append("</connections>")
+    connections_xml = "\n".join(lines)
+
+    conn_rel_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/connections"
+    conn_ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.connections+xml"
+
+    tmp_path = xlsx_path.with_suffix(".tmp.xlsx")
+    try:
+        with _zip.ZipFile(xlsx_path, "r") as zin:
+            names_in_zip = set(zin.namelist())
+            with _zip.ZipFile(tmp_path, "w", _zip.ZIP_DEFLATED) as zout:
+                for item in zin.namelist():
+                    data = zin.read(item)
+
+                    if item == "[Content_Types].xml":
+                        text = data.decode("utf-8")
+                        if conn_ct not in text:
+                            text = text.replace(
+                                "</Types>",
+                                f'<Override PartName="/xl/connections.xml" ContentType="{conn_ct}"/></Types>',
+                            )
+                        zout.writestr(item, text)
+
+                    elif item == "xl/_rels/workbook.xml.rels":
+                        text = data.decode("utf-8")
+                        if conn_rel_type not in text:
+                            text = text.replace(
+                                "</Relationships>",
+                                f'<Relationship Id="rIdConn0" Type="{conn_rel_type}" Target="connections.xml"/></Relationships>',
+                            )
+                        zout.writestr(item, text)
+
+                    elif item == "xl/connections.xml":
+                        zout.writestr(item, connections_xml)  # always replace with ours
+
+                    else:
+                        zout.writestr(item, data)
+
+                if "xl/connections.xml" not in names_in_zip:
+                    zout.writestr("xl/connections.xml", connections_xml)
+
+        xlsx_path.unlink()
+        tmp_path.rename(xlsx_path)
+
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Chat mode — conversational workbook creation
 # ---------------------------------------------------------------------------
 
@@ -123,11 +215,28 @@ def run_chat_mode() -> None:
 
     llm_cfg = get_litellm_config()
 
+    # ---- Resolve friendly model label ----
+    _raw_model = llm_cfg.get("model", "unknown")
+    _model_name = _raw_model.split("/", 1)[-1]  # strip "anthropic/" or "openai/" prefix
+    if llm_cfg.get("base_url", ""):
+        _provider_label = "Grok  [xAI]"
+        _provider_color = "bright_white"
+    elif _raw_model.startswith("anthropic/"):
+        _provider_label = "Anthropic"
+        _provider_color = "orange1"
+    else:
+        _provider_label = "OpenAI"
+        _provider_color = "green"
+
     # ---- Scan templates ----
     templates = scan_templates_raw()
     templates_text = format_templates_for_prompt(templates)
 
     console.rule("[bold cyan]Create Workbook — Chat Mode[/bold cyan]")
+    console.print(
+        f"  Reasoning with  [bold {_provider_color}]{_model_name}[/bold {_provider_color}]"
+        f"  [dim]({_provider_label})[/dim]\n"
+    )
     console.print(
         "\n[bold]Available Templates[/bold] (as reference — agent can use or adapt them):"
     )
@@ -277,6 +386,39 @@ def run_chat_mode() -> None:
         console.print(Panel(raw_yaml, title="Raw Output", border_style="red"))
         return
 
+    # ---- Check .env for real DB credentials ----
+    _cred_map = {
+        "server":   os.getenv("SQL_SERVER", ""),
+        "database": os.getenv("SQL_DATABASE", ""),
+        "username": os.getenv("SQL_USERNAME", ""),
+        "password": os.getenv("SQL_PASSWORD", ""),
+    }
+    _real_creds = {k: v for k, v in _cred_map.items() if v}
+
+    if _real_creds:
+        console.print("\n[yellow bold]Real DB credentials found in .env:[/yellow bold]")
+        _cred_table = Table(show_header=False, box=None, padding=(0, 2))
+        _cred_table.add_column("Field", style="cyan")
+        _cred_table.add_column("Value")
+        for _k, _v in _real_creds.items():
+            _display = "*" * min(len(_v), 12) if _k == "password" else _v
+            _cred_table.add_row(_k, _display)
+        console.print(_cred_table)
+
+        _use_real = Confirm.ask(
+            "Replace 'placeholder' with these credentials in the config?",
+            default=True,
+            console=console,
+        )
+        if _use_real:
+            _conn = config_dict.setdefault("connection", {})
+            for _k, _v in _real_creds.items():
+                _conn[_k] = _v
+            raw_yaml = _yaml.dump(config_dict, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            console.print("[green]Credentials applied.[/green]")
+    else:
+        console.print("\n[dim]No DB credentials found in .env — connection block will use placeholders.[/dim]")
+
     # ---- Show YAML for review ----
     console.print()
     console.print(Panel(
@@ -321,6 +463,15 @@ def run_chat_mode() -> None:
     status_color = "green" if real_success else "red"
     status_word = "COMPLETED" if real_success else "FAILED"
     console.print(f"\n[{status_color}]WF2 {status_word} in {result.duration:.0f}s[/{status_color}]")
+
+    # ---- Inject xl/connections.xml so queries show in Excel's Queries & Connections panel ----
+    if real_success:
+        try:
+            _xlsx_out = Path(EXCEL_MCP_CWD) / config_dict["output"]["path"]
+            _inject_query_connections(_xlsx_out, config_dict)
+            console.print("[dim]  Power Query connections registered in workbook.[/dim]")
+        except Exception as _inj_err:
+            console.print(f"[yellow]  Note: Could not register query connections: {_inj_err}[/yellow]")
 
     if not real_success:
         # Show full stdout so user can see WF2's own error messages

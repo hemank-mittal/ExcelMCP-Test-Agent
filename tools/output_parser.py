@@ -133,11 +133,22 @@ def parse_wf1_outputs_internal(
                 if not signals.vba_found:
                     signals.vba_found = _detect_vba(doc_json)
 
-        # Check for blueprint DB
+        # Check for blueprint DB — only mark as found if the DB actually has data
         db_files = list(doc_dir.glob("*.db"))
         if db_files:
-            signals.blueprint_db_found = True
-            signals.blueprint_db_path = str(db_files[0])
+            import sqlite3 as _sqlite3
+            _db_has_data = False
+            try:
+                _con = _sqlite3.connect(str(db_files[0]))
+                _cur = _con.cursor()
+                _cur.execute("SELECT COUNT(*) FROM workbooks")
+                _db_has_data = (_cur.fetchone()[0] or 0) > 0
+                _con.close()
+            except Exception:
+                pass
+            if _db_has_data:
+                signals.blueprint_db_found = True
+                signals.blueprint_db_path = str(db_files[0])
 
     return signals
 

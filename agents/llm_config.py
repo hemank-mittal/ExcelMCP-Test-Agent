@@ -4,9 +4,9 @@ Shared LLM factory for all agents.
 Provider selection (in order of priority):
   1. AGENT_PROVIDER env var (explicit: "grok", "openai", "anthropic")
   2. Auto-detect from which API key is present
-     XAI_API_KEY present   → Grok
-     OPENAI_API_KEY present → OpenAI
-     ANTHROPIC_API_KEY present → Anthropic
+     ANTHROPIC_API_KEY present → Anthropic (Claude Opus — default)
+     XAI_API_KEY present       → Grok
+     OPENAI_API_KEY present    → OpenAI
 """
 import os
 import litellm
@@ -21,7 +21,7 @@ litellm.drop_params = True
 _DEFAULTS = {
     "grok":      "grok-4-1-fast-non-reasoning",
     "openai":    "gpt-4o-mini",
-    "anthropic": "claude-sonnet-4-6",
+    "anthropic": "claude-opus-4-6",
 }
 
 
@@ -33,16 +33,18 @@ def get_llm() -> LLM:
     openai_key = os.getenv("OPENAI_API_KEY")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
-    # Auto-detect if provider not set
+    # Auto-detect if provider not set — Anthropic preferred
     if not provider:
-        if xai_key:
+        if anthropic_key:
+            provider = "anthropic"
+        elif xai_key:
             provider = "grok"
         elif openai_key:
             provider = "openai"
         else:
             provider = "anthropic"
 
-    model = os.getenv("AGENT_MODEL", _DEFAULTS.get(provider, "gpt-4o-mini"))
+    model = os.getenv("AGENT_MODEL", _DEFAULTS.get(provider, "claude-opus-4-6"))
 
     if provider == "grok":
         if not xai_key:
@@ -91,14 +93,16 @@ def get_litellm_config() -> dict:
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
     if not provider:
-        if xai_key:
+        if anthropic_key:
+            provider = "anthropic"
+        elif xai_key:
             provider = "grok"
         elif openai_key:
             provider = "openai"
         else:
             provider = "anthropic"
 
-    model = os.getenv("AGENT_MODEL", _DEFAULTS.get(provider, "gpt-4o-mini"))
+    model = os.getenv("AGENT_MODEL", _DEFAULTS.get(provider, "claude-opus-4-6"))
 
     if provider == "grok":
         return {
